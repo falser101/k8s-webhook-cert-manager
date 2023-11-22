@@ -93,11 +93,12 @@ subjectAltName = @alt_names
 DNS.1 = ${service}
 DNS.2 = ${service}.${namespace}
 DNS.3 = ${fullServiceDomain}
+DNS.4 = ${fullServiceDomain}.cluster.local
 EOF
-
+echo "/CN=${fullServiceDomain}"
 openssl genrsa -out "${tmpdir}/server-key.pem" 2048
-openssl req -new -key "${tmpdir}/server-key.pem" -subj "/CN=${fullServiceDomain}" -out "${tmpdir}/server.csr" -config "${tmpdir}/csr.conf"
-
+#openssl req -new -key "${tmpdir}/server-key.pem" -subj "/CN=${fullServiceDomain}" -out "${tmpdir}/server.csr" -config "${tmpdir}/csr.conf"
+openssl req -new -key "${tmpdir}/server-key.pem" -subj "/CN=system:node:${fullServiceDomain};/O=system:nodes" -out "${tmpdir}/server.csr" -config "${tmpdir}/csr.conf"
 set +e
 # clean-up any previously created CSR for our service. Ignore errors if not present.
 if kubectl delete csr "${csrName}"; then
@@ -107,31 +108,42 @@ set -e
 
 # create server cert/key CSR and send it to k8s api
 cat <<EOF | kubectl create -f -
-apiVersion: certificates.k8s.io/v1beta1
+apiVersion: certificates.k8s.io/v1
 kind: CertificateSigningRequest
 metadata:
   name: ${csrName}
 spec:
+  #signerName: kubernetes.io/kube-apiserver-client
+  signerName: kubernetes.io/kubelet-serving
   groups:
   - system:authenticated
   request: $(base64 < "${tmpdir}/server.csr" | tr -d '\n')
   usages:
+  - server auth
   - digital signature
   - key encipherment
-  - server auth
 EOF
 
 set +e
 # verify CSR has been created
 while true; do
   if kubectl get csr "${csrName}"; then
+      echo "CertificateSigningRequest create succsee"
       break
   fi
 done
 set -e
 
-# approve and fetch the signed certificate . !! not working with k8s 1.19.1, running the command separately outside of the container / node 
-# kubectl certificate approve "${csrName}"
+# approve and fetch the signed certificate . !! not working with k8s 1.19.1, running the command separately outside of the container / node
+set +e
+while true; do
+  if kubectl certificate approve "${csrName}"; then
+     echo "${csrName} certificate approve"
+     break
+  fi
+done
+
+set -e
 
 set +e
 # verify certificate has been signed
@@ -161,8 +173,8 @@ kubectl create secret tls "${secret}" \
       --dry-run -o yaml |
   kubectl -n "${namespace}" apply -f -
 
-caBundle=$(base64 < /run/secrets/kubernetes.io/serviceaccount/ca.crt  | tr -d '\n')
-
+#caBundle=$(base64 < /run/secrets/kubernetes.io/serviceaccount/ca.crt  | tr -d '\n')
+caBundle=$(cat ${tmpdir}/server-cert.pem)
 set +e
 # Patch the webhook adding the caBundle. It uses an `add` operation to avoid errors in OpenShift because it doesn't set
 # a default value of empty string like Kubernetes. Instead, it doesn't create the caBundle key.
@@ -170,7 +182,7 @@ set +e
 # the job will not end until the webhook is patched.
 while true; do
   echo "INFO: Trying to patch webhook adding the caBundle."
-  if kubectl patch "${kind:-mutatingwebhookconfiguration}" "${webhook}" --type='json' -p "[{'op': 'add', 'path': '/webhooks/0/clientConfig/caBundle', 'value':'${caBundle}'}]"; then
+  if kubectl patch "${kind:-mutatingwebhookconfiguration}" "${webhook}" --type='json' -p "[{'op': 'add', 'path': '/webhooks/0/clientConfig/caBundle', 'value':'${serverCert}'}]"; then
       break
   fi
   echo "INFO: webhook not patched. Retrying in 5s..."
